@@ -1,5 +1,33 @@
 # 敦煌经书残卷 AI 分析 · Dunhuang Sutra Fragment AI Analyzer
 
+## 🌏 项目简介 · Project Overview
+
+**中文**：本项目面向敦煌学 / 佛教文献研究者，使用 Google Gemini 多模态能力，对敦煌经书残卷图片进行 OCR 粗识别，并自动联动 CBETA 与 Gallica（法国国家图书馆）检索，对照写本/刻本文本，给出候选经文、校勘线索与人工校对建议。  
+**English**: This project targets researchers of Dunhuang studies and Buddhist texts. It leverages Google Gemini for multimodal OCR on Dunhuang sutra fragments, then cross-checks CBETA and Gallica manuscripts to propose candidate passages, collational hints, and suggestions for human verification.
+
+## ⚡ 快速上手 · Quick Start
+
+1. 克隆仓库 / Clone the repo  
+   ```bash
+   git clone https://github.com/hzlgames/dunhuang-sutra-fragment-ai-analyzer.git
+   cd dunhuang-sutra-fragment-ai-analyzer
+   ```
+2. 创建虚拟环境并安装依赖 / Create venv & install deps  
+   ```bash
+   python -m venv venv
+   venv\Scripts\activate  # Windows
+   pip install -r requirements.txt
+   ```
+3. 配置 `GOOGLE_API_KEY`（以及可选的 `GEMINI_API_KEY`、`GALLICA_MCP_PATH`），详见下文“配置步骤”。  
+4. 批量处理图片 / Batch processing:  
+   ```bash
+   python -m src.main --input input --output output
+   ```
+5. 单张验证 / Single image verification:  
+   ```bash
+   python verify_integration.py
+   ```
+
 ## 📋 概述（原名：OCR 多渠道使用指南）
 
 系统现在聚焦于 **Google 官方 Gemini API**，通过一个统一的 `CBETAAgent` 完成：
