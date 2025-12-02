@@ -1,4 +1,4 @@
-# 敦煌经书残卷 AI 分析 · Dunhuang Sutra Fragment AI Analyzer
+# 敦煌经书残卷 AI 检索与校对 · Dunhuang Sutra Fragment Retrieval & Collation
 
 ## 🌏 项目简介 · Project Overview
 
