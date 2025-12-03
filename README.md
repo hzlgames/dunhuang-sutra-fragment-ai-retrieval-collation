@@ -153,7 +153,7 @@ AgentConfig(
 python -m src.main --input input --output output
 ```
 
-每张图片会产出三类与调试相关的文件：
+每张图片会产出四类与调试 / 整理相关的文件：
 
 1. **流式事件日志**：`output/<文件名>_stream.jsonl`
    - 每行一条 JSON，字段示意：
@@ -166,12 +166,19 @@ python -m src.main --input input --output output
    - 核心字段：
      - `ocr_result.recognized_text`: 最终整理的 OCR 文本（允许用 `[?]` 标记不确定字符）
      - `ocr_notes`: **逐列/逐句 OCR 摘要**，解释哪些字不确定、如何判断
-     - `scripture_locations`: 经文候选列表及置信度（主要来自 CBETA，也可能包含 Gallica 对照）
+     - `scripture_locations`: 经文候选列表及置信度（主要来自 CBETA，也可以包含 Gallica 写本作为“藏卷”对照）
+       - 对 CBETA 候选：可设置 `source="CBETA"`，并保证 `work_id` / `canon` / `juan` 等信息完整。
+       - 对 Gallica 候选：可设置 `source="Gallica"`，并在 `external_url` 中给出可直接打开的 Gallica 在线阅读链接（如 `https://gallica.bnf.fr/ark:/12148/.../f3.item`）。
+     - `key_facts`: 片段关键信息列表，每条一句，**直接从图像与正文可见信息中提取**，包括但不限于：
+       - 物质形态：册子本 / 单叶 / 对开叶、叶数、装订方式、首尾及左右上下残损情况等；
+       - 题记与尾题：首题、尾题、署名、题记中的时间与人物；
+       - 版式与标记：有无科分标题、行数/栏数、朱笔圈点或删除、杂写、插图等。
      - `candidate_insights`: 对候选经文的关键判断与“CBETA vs Gallica”对比结论
      - `verification_points`: 推荐人工校对的要点（疑难字、需查卷/页、Gallica ARK 等）
      - `next_actions`: 给研究者的下一步建议（如“查 T1753 卷2 某页”，“查 Gallica ark:/12148/... f3 页”）
      - `reasoning`: 推理过程文字说明
      - `tools_used`, `search_iterations`, `session_id` 等统计信息。
+   - 可作为二次程序处理或导入其他分析管线的基础数据。
 
 3. **可读报告**：`output/<文件名>_report.txt`
    - 为研究者/产品同学准备的**人工校对友好版摘要**，大致结构为：
@@ -180,6 +187,14 @@ python -m src.main --input input --output output
      - 「校对提示」：建议重点核对的文字与位置（含 Gallica 页码/ARK）
      - 「建议的下一步」：如何在 CBETA / Gallica 继续深挖
      - 「推理与工具」：简洁回顾 AI 的推理路径与工具使用统计
+
+4. **附带说明文档**：`output/<文件名>_note.txt`
+   - 面向正式研究成果附录的“文献整理说明”草稿，风格参考 `文献整理结果示例.txt`：
+     - 首行使用图片文件名（去掉扩展名）作为编号（如 `P.3801`、`Дх.00931`）；
+     - 「文献内容：」：基于 `scripture_locations` 与 `key_facts` 列出主要经文信息（经名、经号、译者、CBETA/Gallica 信息、首尾残缺情况等），必要时将 Gallica 写本视作“藏卷”写入；
+     - 「物质形态：」：优先复用 `key_facts` 中与装帧/残损相关的条目；如无可用信息，则给出一条占位说明，提示研究者根据原件补充（如“册子本，两张对开叶，首尾俱残”等）；
+     - 「参：」部分目前预留给研究者根据实际论文、工具书等手动补充（如张总、党燕妮等研究），模型不会强行自动生成，以免混入不准确引文。
+   - 该文件意在为研究者提供一个可直接复制进论文或目录的基础骨架，节省手动誊写时间，但**仍需人工审阅与润色**。
 
 ### 单张验证 (`verify_integration.py`)
 
