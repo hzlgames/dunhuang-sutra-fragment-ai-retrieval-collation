@@ -37,6 +37,13 @@
 
 即：优先在 CBETA 中找出处，必要时自动调用 Gallica 作为“敦煌/西域写本分身”，进行多模态比对。
 
+## 🛟 轮次持久化与自动恢复
+
+1. `CBETAAgent` 会在每轮推理结束后，把该轮的 OCR 摘要 + 工具调用记录写入 `sessions/<session_id>.rounds.jsonl`，确保即便 AI 连线中断或你只想复用已有搜索路径，也可以从本地拿出关键线索。
+2. `SessionManager` 提供 `load_rounds` 和 `build_round_history_contents`，可以把这些记录转成可直接拼装到 Gemini 上下文中的“历史摘要段”，自动向模型说明前面的思路与调用结果。
+3. `resume_with_session(session_id, …)` 入口允许你以已存在的会话 ID 继续思考，只需提供新的 OCR/图片输入，模型会在已有总结的基础上开展下一轮探索；也可以通过 `include_final_output=False` 仅保存中间轮结果而跳过最终 JSON 结构化输出。
+4. 配合新加的 `tests/test_round_persistence.py`，确保轮次存档读写与自动恢复逻辑在常规测试环境下可被验证。
+
 ## 🔧 配置步骤
 
 ### 1. 配置 Google 官方 API

@@ -90,6 +90,12 @@ def summarize_final_answer(answer: FinalAnswer) -> str:
     if answer.ocr_result.word_segmentation:
         lines.append(f"分词片段：{', '.join(answer.ocr_result.word_segmentation)}")
 
+    # 片段关键信息：物质形态、题记、版式等
+    if getattr(answer, "key_facts", None):
+        lines.append("\n========== 片段关键信息 ==========")
+        for idx, fact in enumerate(answer.key_facts, 1):
+            lines.append(f"{idx}. {fact}")
+
     lines.append("\n========== 候选经文（按置信度） ==========")
     if answer.scripture_locations:
         for idx, loc in enumerate(answer.scripture_locations, 1):
@@ -101,6 +107,23 @@ def summarize_final_answer(answer: FinalAnswer) -> str:
                 f"   置信度: {loc.confidence:.2f} | 依据: {loc.confidence_reason}"
             )
             lines.append(f"   匹配片段: {loc.snippet}")
+
+            # 若模型已给出外部在线阅览链接（如 Gallica），直接展示
+            if getattr(loc, "external_url", None):
+                source_label = getattr(loc, "source", None) or "外部"
+                lines.append(f"   {source_label}在线阅览: {loc.external_url}")
+            else:
+                # 默认假定为 CBETA 经文，附带可直接打开的 CBETA 在线阅览链接
+                # 约定：work_id 如 T0001，卷号 loc.juan 可转为三位数字，例如 1 -> 001
+                cbeta_url = None
+                try:
+                    juan_num = int(str(loc.juan).strip())
+                    cbeta_url = f"https://cbetaonline.dila.edu.tw/zh/{loc.work_id}_{juan_num:03d}"
+                except (ValueError, TypeError):
+                    # 卷号无法转为整数时，只给一个按经号搜索的备用链接
+                    cbeta_url = f"https://cbetaonline.dila.edu.tw/zh/search?keyword={loc.work_id}"
+
+                lines.append(f"   在线阅览: {cbeta_url}")
     else:
         lines.append("暂无可信候选，请手动继续搜索。")
 
@@ -132,6 +155,88 @@ def summarize_final_answer(answer: FinalAnswer) -> str:
     return "\n".join(lines)
 
 
+def build_fragment_note(answer: FinalAnswer, image_name: str) -> str:
+    """
+    构造单张图片对应的“文献整理说明”，风格参考 `文献整理结果示例.txt`。
+    - image_name：不含扩展名的文件名，直接作为编号使用（如：P.3801、Дх.00931）。
+    """
+    lines: List[str] = []
+
+    # 编号行
+    lines.append(image_name)
+
+    # 文献内容
+    lines.append("文献内容：")
+    if answer.scripture_locations:
+        for idx, loc in enumerate(answer.scripture_locations, 1):
+            # 基本书目信息（CBETA / Gallica 共用骨架）
+            base_parts: List[str] = []
+            # (1) 经名
+            base_parts.append(loc.work_title)
+            # (2) 经号（如 CBETA T08, no. 235）
+            if loc.canon and loc.work_id:
+                # work_id 通常为 T0235/X0021 等，这里拆成藏经/编号两部分
+                canon_code = loc.canon
+                work_code = loc.work_id
+                base_parts.append(f"CBETA，{canon_code}，no.{work_code.lstrip(canon_code)}")
+            elif loc.work_id:
+                base_parts.append(f"编号：{loc.work_id}")
+            # (3) 译者/作者
+            if loc.author:
+                base_parts.append(f"{loc.author}译")
+
+            # 组合主句
+            main_sentence = "，".join(base_parts) if base_parts else loc.work_title
+
+            # 完整度描述由 AI 在置信度理由中常会体现，这里简化引用
+            completeness = ""
+            if "首尾" in (loc.confidence_reason or ""):
+                completeness = loc.confidence_reason
+
+            # Gallica / 其他来源标记
+            source_label = getattr(loc, "source", None)
+            if source_label and source_label.lower() == "gallica":
+                main_sentence += "（Gallica 写本）"
+
+            # 输出一条文献内容说明
+            content_line = f"（{idx}）{main_sentence}"
+            if completeness:
+                content_line += f"。{completeness}"
+            lines.append(content_line)
+
+            # 若有在线链接，继续在内容部分给出
+            external_url = getattr(loc, "external_url", None)
+            if external_url:
+                if source_label and source_label.lower() == "gallica":
+                    lines.append(f"    Gallica 在线阅览：{external_url}")
+                else:
+                    lines.append(f"    在线阅览：{external_url}")
+    else:
+        lines.append("（暂未能明确定位对应经文，需人工补充。）")
+
+    # 物质形态：
+    if answer.key_facts:
+        for idx, fact in enumerate(answer.key_facts, 1):
+            lines.append(f"{idx}. {fact}")
+    else:
+        lines.append("物质形态：（本工具暂无法从图像中精确判断装帧与残损情况，建议研究者根据原件补充，如“册子本，两张对开叶，首尾俱残”等。）")
+
+    # 参考文献（可选）：尝试从 candidate_insights / next_actions 中抽取
+    # refs: List[str] = []
+    # for item in (answer.candidate_insights or []):
+    #     if "《" in item and "》" in item:
+    #         refs.append(item)
+    # for item in (answer.next_actions or []):
+    #     if "《" in item and "》" in item and item not in refs:
+    #         refs.append(item)
+    #
+    # if refs:
+    #     lines.append("参：")
+    #     for idx, r in enumerate(refs, 1):
+    #         lines.append(f"（{idx}）{r}")
+
+    return "\n".join(lines)
+
 def process_image(agent: CBETAAgent, image_path: Path, output_dir: Path, mirror_stdout: bool):
     print(f"\n📷 处理图片: {image_path.name}")
     log_path = output_dir / f"{image_path.stem}_stream.jsonl"
@@ -153,6 +258,11 @@ def process_image(agent: CBETAAgent, image_path: Path, output_dir: Path, mirror_
     report_path = output_dir / f"{image_path.stem}_report.txt"
     report_path.write_text(summarize_final_answer(result), encoding="utf-8")
     print(f"📝 文本报告已保存: {report_path}")
+
+    # 生成“文献整理说明”附带文档
+    note_path = output_dir / f"{image_path.stem}_note.txt"
+    note_path.write_text(build_fragment_note(result, image_path.stem), encoding="utf-8")
+    print(f"📄 文献整理说明已保存: {note_path}")
 
 
 def main():

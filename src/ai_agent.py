@@ -1,5 +1,6 @@
 import os
 import json
+import textwrap
 import time
 import uuid
 from typing import List, Dict, Any, Optional, Generator, Callable
@@ -20,7 +21,7 @@ class AgentConfig(BaseModel):
     """Agent 配置"""
     thinking_level: str = "high"  # "low" or "high"
     max_tool_rounds: int = 5  # 最多工具调用轮数（不含最终结构化输出轮）
-    retry_interval: int = 30  # 重试间隔秒数
+    retry_interval: int = 10  # 重试间隔秒数
     normal_retries: int = 3  # 普通轮重试次数
     final_retries: int = 5  # 最终结构化输出轮重试次数
     timeout_seconds: int = 120
@@ -57,6 +58,77 @@ class SessionManager:
         """加载会话历史"""
         # 简化版：不实际加载历史
         return []
+
+    def _rounds_path(self, session_id: str) -> Path:
+        return self.storage_dir / f"{session_id}.rounds.jsonl"
+
+    def save_round(self, session_id: str, payload: Dict[str, Any]):
+        """将单轮摘要写入 JSONL 文件"""
+        file_path = self._rounds_path(session_id)
+        try:
+            with open(file_path, "a", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+                f.write("\n")
+        except OSError as exc:
+            print(f"⚠️ 保存轮次记录失败: {exc}")
+
+    def load_rounds(self, session_id: str) -> List[Dict[str, Any]]:
+        """读取指定会话的轮次记录"""
+        file_path = self._rounds_path(session_id)
+        rounds: List[Dict[str, Any]] = []
+        if not file_path.exists():
+            return rounds
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rounds.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as exc:
+            print(f"⚠️ 读取轮次记录失败: {exc}")
+            return rounds
+
+        return sorted(rounds, key=lambda record: record.get("round_index", 0))
+
+
+def build_round_history_contents(round_records: List[Dict[str, Any]]) -> List[types.Content]:
+    """将轮次记录转换为 Gemini 可用的历史消息"""
+    contents: List[types.Content] = []
+    for record in round_records:
+        round_index = record.get("round_index", "?")
+        segments: List[str] = []
+        summary = (record.get("summary") or "").strip()
+        segments.append(
+            f"【历史第 {round_index} 轮摘要】{summary or '未提供摘要'}"
+        )
+
+        tool_calls = record.get("tool_calls") or []
+        if tool_calls:
+            tools_desc = []
+            for call in tool_calls:
+                name = call.get("name", "unknown")
+                args = call.get("args", {})
+                try:
+                    args_str = json.dumps(args, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    args_str = str(args)
+
+                result_summary = call.get("result_summary", "")
+                tools_desc.append(f"{name}({args_str}) → {result_summary}")
+            segments.append("工具调用: " + " | ".join(tools_desc))
+
+        notes = record.get("notes") or []
+        for note in notes:
+            segments.append(f"备注: {note}")
+
+        contents.append(types.Content(role="user", parts=[types.Part(text="\n".join(segments))]))
+
+    return contents
 
 class CBETAAgent:
     def __init__(self, config: Optional[AgentConfig] = None):
@@ -530,14 +602,22 @@ class CBETAAgent:
 ### 3. 精确定位与交叉验证
 - 对高置信度候选，使用 `search_kwic` 等获取上下文
 - 汇总证据：匹配字句、卷次、作译者、朝代
-- **CBETA vs Gallica 对照**：在 `candidate_insights` 中记录两者差异
+- **CBETA vs Gallica 对照**：在 `candidate_insights` 中记录两者差异（可选）
 - 指出仍需人工确认的差异或疑点
 
 ### 4. 结构化输出（便于人工校对）
 最终 JSON 中请确保：
 - `ocr_result.recognized_text`：合并后的全文；`uncertain_chars`：列出所有标记
 - `ocr_notes`：列表，逐列/逐句描述 OCR 摘要（含不确定说明）
-- `scripture_locations`：至多 5 条候选，含匹配片段、置信度、证据
+- `scripture_locations`：至多 5 条候选，含匹配片段、置信度、证据：
+  - 对 **CBETA** 候选：可设置 `source="CBETA"`，`work_id`/`canon`/`juan` 等字段准确完整，`external_url` 可留空（系统会自动生成 CBETA 在线链接）。
+  - 对 **Gallica** 候选：允许将写本视作“藏卷”加入 `scripture_locations`，并设置：
+    - `source="Gallica"`
+    - 若已知 ARK 与页码，尽量填入 `external_url` 为可直接打开的 Gallica 在线阅读链接（例如 `https://gallica.bnf.fr/ark:/12148/btv1b8304226d/f3.item`）
+- `key_facts`：片段关键信息列表，每项一句，直接基于图像与正文可见内容（**不**依赖外部文献），例如：
+  - 物质形态：册子本/单叶/对开叶，页数或叶数，装订情况，残损位置（首/尾/左右上下）。
+  - 题记与尾题：首题、尾题、署名、题记中的时间与人物。
+  - 版式与标记：有无科分标题、行数栏数、朱笔圈点/删除、杂写、插图等。
 - `candidate_insights`：逐条概述候选为何值得关注，**包括 Gallica 证据**，以及需人工核对的点
 - `verification_points`：列出人工校对要点（疑难字、需查卷、**Gallica ARK/页码**、建议的 KWIC 位置等）
 - `next_actions`：给实地研究者的后续建议（如"去查 T1753 卷2 KWIC 0258a25"、**"查阅 Gallica ark:/12148/xxx f3 页"**）
@@ -579,19 +659,22 @@ class CBETAAgent:
                 # 执行实际函数
                 if fn.name in self.tools_map:
                     try:
-                        # 将 args 转换为 dict
                         args = {k: v for k, v in (fn.args or {}).items()}
                         result = self.tools_map[fn.name](**args)
-                        
+
                         if self.config.verbose:
                             print(f"   ✅ 工具执行完成")
-                            # 简略打印结果
                             res_str = str(result)
                             print(f"   结果摘要: {res_str[:100]}..." if len(res_str) > 100 else f"   结果: {res_str}")
-                            
-                        summary = str(result)
-                        if len(summary) > 120:
-                            summary = summary[:117] + "..."
+
+                        summary = self._shorten_text(str(result), width=120)
+                        record = {
+                            "name": fn.name,
+                            "args": self._serialize_args(args),
+                            "result_summary": summary,
+                            "status": "success",
+                        }
+
                         self._emit_event(
                             "tool_result",
                             {"name": fn.name, "status": "success", "summary": summary},
@@ -601,17 +684,25 @@ class CBETAAgent:
                         yield {
                             "function_response": {
                                 "name": fn.name,
-                                "response": {"result": result}  # 包装在 result 中
-                            }
+                                "response": {"result": result}
+                            },
+                            "tool_record": record,
                         }
                     except Exception as e:
                         print(f"   ❌ 工具执行失败: {e}")
+                        summary = self._shorten_text(str(e), width=120)
+                        record = {
+                            "name": fn.name,
+                            "args": self._serialize_args({k: v for k, v in (fn.args or {}).items()}),
+                            "result_summary": summary,
+                            "status": "error",
+                        }
                         self._emit_event(
                             "tool_result",
                             {
                                 "name": fn.name,
                                 "status": "error",
-                                "summary": str(e),
+                                "summary": summary,
                             },
                             stream_handler,
                         )
@@ -619,7 +710,8 @@ class CBETAAgent:
                             "function_response": {
                                 "name": fn.name,
                                 "response": {"error": str(e)}
-                            }
+                            },
+                            "tool_record": record,
                         }
                 else:
                     print(f"   ⚠️ 未知工具: {fn.name}")
@@ -628,6 +720,60 @@ class CBETAAgent:
                         {"message": f"未知工具: {fn.name}"},
                         stream_handler,
                     )
+
+    def _serialize_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """将工具参数转换为 JSON 友好的形式"""
+        def convert(value: Any) -> Any:
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, dict):
+                return {k: convert(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [convert(v) for v in value]
+            return str(value)
+
+        return {k: convert(v) for k, v in args.items()}
+
+    def _shorten_text(self, text: str, width: int) -> str:
+        cleaned = " ".join(str(text).split())
+        if not cleaned:
+            return ""
+        return textwrap.shorten(cleaned, width=width, placeholder="...")
+
+    def _extract_round_text_summary(self, parts: List[types.Part]) -> str:
+        texts = []
+        for part in parts:
+            if part.text and not part.function_call:
+                cleaned = " ".join(part.text.split())
+                if cleaned:
+                    texts.append(cleaned)
+        if not texts:
+            return ""
+        joined = " ".join(texts)
+        return self._shorten_text(joined, width=600)
+
+    def _persist_round_summary(
+        self,
+        session_id: str,
+        round_index: int,
+        summary: str,
+        tool_calls: List[Dict[str, Any]],
+        notes: List[str],
+    ):
+        payload = {
+            "round_index": round_index,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "summary": summary,
+            "tool_calls": tool_calls,
+            "notes": notes,
+        }
+        self.session_manager.save_round(session_id, payload)
+
+    def _build_history_from_rounds(self, session_id: str) -> List[types.Content]:
+        rounds = self.session_manager.load_rounds(session_id)
+        if not rounds:
+            return []
+        return build_round_history_contents(rounds)
 
     def _force_structured_output(
         self,
@@ -651,9 +797,12 @@ class CBETAAgent:
         
         history.append(types.Content(role="user", parts=[types.Part(text=final_prompt)]))
         
+        # 使用官方推荐的 structured output 配置：
+        # - response_mime_type 固定为 application/json
+        # - response_schema 传入 Pydantic 生成的 JSON Schema
         final_config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_json_schema=FinalAnswer.model_json_schema()
+            response_schema=FinalAnswer.model_json_schema(),
         )
         
         try:
@@ -681,6 +830,8 @@ class CBETAAgent:
         ocr_text: str = None,
         image_path: str = None,
         stream_handler: Optional[StreamHandler] = None,
+        resume_session_id: Optional[str] = None,
+        include_final_output: bool = True,
     ) -> FinalAnswer:
         """
         主流程：分析并定位经文出处。
@@ -688,14 +839,20 @@ class CBETAAgent:
         流程说明：
         - 最多进行 max_tool_rounds 轮工具调用（默认5轮）
         - AI 可随时选择不调用工具，提前结束
-        - 无论如何，最后都会强制生成结构化输出（不计入轮数）
+        - 可选择跳过最终结构化输出，仅依靠轮次存档
         - 普通轮重试 normal_retries 次，最终轮重试 final_retries 次
         """
-        session_id = self.session_manager.create_session()
-        if self.config.verbose:
-            print(f"🔵 开始新会话: {session_id}")
-            print(f"   最多工具调用轮数: {self.config.max_tool_rounds}")
-            
+        history: List[types.Content] = []
+        if resume_session_id:
+            session_id = resume_session_id
+            history.extend(self._build_history_from_rounds(session_id))
+            if self.config.verbose:
+                print(f"🔄 继续会话: {session_id}")
+        else:
+            session_id = self.session_manager.create_session()
+            if self.config.verbose:
+                print(f"🔵 开始新会话: {session_id}")
+                print(f"   最多工具调用轮数: {self.config.max_tool_rounds}")
         prompt = self._build_prompt(ocr_text, image_path)
         
         # 如果有图片，加载图片
@@ -726,7 +883,7 @@ class CBETAAgent:
             else:
                 raise TypeError("Unsupported content type for Gemini request.")
 
-        history = [types.Content(role="user", parts=parts)]
+        history.append(types.Content(role="user", parts=parts))
         
         tool_round = 0  # 工具调用轮数计数
         successful_rounds = 0
@@ -772,6 +929,10 @@ class CBETAAgent:
                 
             candidate = response.candidates[0]
             content = candidate.content
+            round_summary = self._extract_round_text_summary(content.parts)
+            tool_records: List[Dict[str, Any]] = []
+            json_result: Optional[FinalAnswer] = None
+            should_break = False
             
             successful_rounds += 1
 
@@ -791,9 +952,10 @@ class CBETAAgent:
                         name=output["function_response"]["name"],
                         response=output["function_response"]["response"]
                     ))
+                    if "tool_record" in output:
+                        tool_records.append(output["tool_record"])
                 
                 history.append(types.Content(role="user", parts=parts))
-                
             else:
                 # AI 选择不调用工具，尝试从回复中提取 JSON
                 text_response = "".join([p.text for p in content.parts if p.text])
@@ -808,18 +970,39 @@ class CBETAAgent:
                         json_str = text_response[start:end]
                         result = FinalAnswer.model_validate_json(json_str)
                         result.session_id = session_id
-                        self.session_manager.save_session(session_id, history)
-                        return result
+                        json_result = result
                     except Exception as e:
                         if self.config.verbose:
                             print(f"   JSON 解析失败: {e}，进入最终结构化输出轮...")
                 
-                # 无法解析 JSON，跳出循环进入最终结构化输出
+                if not json_result:
+                    should_break = True
+
+            notes: List[str] = []
+            if not round_summary:
+                notes.append("本轮未产生文本摘要")
+            if not has_tool_call:
+                notes.append("本轮未调用工具")
+            if json_result:
+                notes.append("提前生成结构化结果，结束本轮")
+
+            self._persist_round_summary(
+                session_id,
+                round_index=tool_round,
+                summary=round_summary,
+                tool_calls=tool_records,
+                notes=notes,
+            )
+
+            if json_result:
+                self.session_manager.save_session(session_id, history)
+                return json_result
+            if should_break:
                 break
         
         # ===== 最终结构化输出轮（不计入工具调用轮数） =====
         if self.config.verbose:
-            print(f"\n📊 工具调用阶段结束（共 {tool_round} 轮），进入最终结构化输出...")
+            print(f"\n📊 工具调用阶段结束（共 {tool_round} 轮）")
         
         if successful_rounds == 0:
             if self.config.verbose:
@@ -827,9 +1010,37 @@ class CBETAAgent:
             self.session_manager.save_session(session_id, history)
             return None
 
+        if not include_final_output:
+            if self.config.verbose:
+                print("⚠️ 已配置跳过最终结构化输出（仅保留轮次存档）。")
+            self.session_manager.save_session(session_id, history)
+            return None
+
+        if self.config.verbose:
+            print("📊 进入最终结构化输出（结构化 JSON）...")
+
         result = self._force_structured_output(history, session_id)
         
         # 保存会话
         self.session_manager.save_session(session_id, history)
         
         return result
+
+    def resume_with_session(
+        self,
+        session_id: str,
+        ocr_text: str = None,
+        image_path: str = None,
+        stream_handler: Optional[StreamHandler] = None,
+        include_final_output: bool = True,
+    ) -> FinalAnswer:
+        """
+        从已有会话的轮次存档重建上下文，继续或重新发起思考。
+        """
+        return self.analyze_and_locate(
+            ocr_text=ocr_text,
+            image_path=image_path,
+            stream_handler=stream_handler,
+            resume_session_id=session_id,
+            include_final_output=include_final_output,
+        )
