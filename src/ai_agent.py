@@ -21,7 +21,7 @@ class AgentConfig(BaseModel):
     """Agent 配置"""
     thinking_level: str = "high"  # "low" or "high"
     max_tool_rounds: int = 5  # 最多工具调用轮数（不含最终结构化输出轮）
-    retry_interval: int = 10  # 重试间隔秒数
+    retry_interval: int = 20  # 重试间隔秒数
     normal_retries: int = 3  # 普通轮重试次数
     final_retries: int = 5  # 最终结构化输出轮重试次数
     timeout_seconds: int = 120
@@ -769,6 +769,88 @@ class CBETAAgent:
         }
         self.session_manager.save_round(session_id, payload)
 
+    def _handle_model_response(
+        self,
+        *,
+        session_id: str,
+        round_index: int,
+        response: types.GenerateContentResponse,
+        content: types.Content,
+        stream_handler: Optional[StreamHandler],
+    ) -> Dict[str, Any]:
+        """
+        统一处理单轮模型返回，执行工具并生成摘要，供单任务与批量流程复用。
+        """
+        round_summary = self._extract_round_text_summary(content.parts)
+        tool_records: List[Dict[str, Any]] = []
+        json_result: Optional[FinalAnswer] = None
+        should_break = False
+        next_user_content: Optional[types.Content] = None
+
+        has_tool_call = any(part.function_call for part in content.parts)
+
+        if has_tool_call:
+            tool_outputs = list(self._execute_functions(response, stream_handler))
+
+            if tool_outputs:
+                parts = []
+                for output in tool_outputs:
+                    parts.append(
+                        types.Part.from_function_response(
+                            name=output["function_response"]["name"],
+                            response=output["function_response"]["response"],
+                        )
+                    )
+                    if "tool_record" in output:
+                        tool_records.append(output["tool_record"])
+
+                next_user_content = types.Content(role="user", parts=parts)
+        else:
+            text_response = "".join([p.text for p in content.parts if p.text])
+
+            if self.config.verbose:
+                print(f"\n📝 AI 回复（第 {round_index} 轮无工具调用）")
+
+            if "{" in text_response and "}" in text_response:
+                try:
+                    start = text_response.find("{")
+                    end = text_response.rfind("}") + 1
+                    json_str = text_response[start:end]
+                    result = FinalAnswer.model_validate_json(json_str)
+                    result.session_id = session_id
+                    json_result = result
+                except Exception as e:
+                    if self.config.verbose:
+                        print(f"   JSON 解析失败: {e}，进入最终结构化输出轮...")
+
+            if not json_result:
+                should_break = True
+
+        notes: List[str] = []
+        if not round_summary:
+            notes.append("本轮未产生文本摘要")
+        if not has_tool_call:
+            notes.append("本轮未调用工具")
+        if json_result:
+            notes.append("提前生成结构化结果，结束本轮")
+
+        self._persist_round_summary(
+            session_id,
+            round_index=round_index,
+            summary=round_summary,
+            tool_calls=tool_records,
+            notes=notes,
+        )
+
+        return {
+            "json_result": json_result,
+            "should_break": should_break,
+            "next_user_content": next_user_content,
+            "tool_records": tool_records,
+            "round_summary": round_summary,
+            "notes": notes,
+        }
+
     def _build_history_from_rounds(self, session_id: str) -> List[types.Content]:
         rounds = self.session_manager.load_rounds(session_id)
         if not rounds:
@@ -859,10 +941,11 @@ class CBETAAgent:
         if image_path:
             try:
                 from PIL import Image
-                img = Image.open(image_path)
-                if self.config.verbose:
-                    print(f"🖼️ 已加载图片: {image_path}")
-                mime_type = Image.MIME.get(img.format, "image/png")
+                # 使用上下文管理器，避免文件句柄未关闭导致 Windows 下 unlink 失败
+                with Image.open(image_path) as img:
+                    if self.config.verbose:
+                        print(f"🖼️ 已加载图片: {image_path}")
+                    mime_type = Image.MIME.get(img.format, "image/png")
                 with open(image_path, "rb") as f:
                     image_bytes = f.read()
                 image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
@@ -929,70 +1012,25 @@ class CBETAAgent:
                 
             candidate = response.candidates[0]
             content = candidate.content
-            round_summary = self._extract_round_text_summary(content.parts)
-            tool_records: List[Dict[str, Any]] = []
-            json_result: Optional[FinalAnswer] = None
-            should_break = False
-            
             successful_rounds += 1
 
             # 将模型响应加入历史
             history.append(content)
             
-            # 检查工具调用
-            has_tool_call = any(part.function_call for part in content.parts)
-            
-            if has_tool_call:
-                # 执行工具
-                tool_outputs = list(self._execute_functions(response, stream_handler))
-                
-                parts = []
-                for output in tool_outputs:
-                    parts.append(types.Part.from_function_response(
-                        name=output["function_response"]["name"],
-                        response=output["function_response"]["response"]
-                    ))
-                    if "tool_record" in output:
-                        tool_records.append(output["tool_record"])
-                
-                history.append(types.Content(role="user", parts=parts))
-            else:
-                # AI 选择不调用工具，尝试从回复中提取 JSON
-                text_response = "".join([p.text for p in content.parts if p.text])
-                
-                if self.config.verbose:
-                    print(f"\n📝 AI 回复（第 {tool_round} 轮无工具调用）")
-                
-                if "{" in text_response and "}" in text_response:
-                    try:
-                        start = text_response.find("{")
-                        end = text_response.rfind("}") + 1
-                        json_str = text_response[start:end]
-                        result = FinalAnswer.model_validate_json(json_str)
-                        result.session_id = session_id
-                        json_result = result
-                    except Exception as e:
-                        if self.config.verbose:
-                            print(f"   JSON 解析失败: {e}，进入最终结构化输出轮...")
-                
-                if not json_result:
-                    should_break = True
-
-            notes: List[str] = []
-            if not round_summary:
-                notes.append("本轮未产生文本摘要")
-            if not has_tool_call:
-                notes.append("本轮未调用工具")
-            if json_result:
-                notes.append("提前生成结构化结果，结束本轮")
-
-            self._persist_round_summary(
-                session_id,
+            round_result = self._handle_model_response(
+                session_id=session_id,
                 round_index=tool_round,
-                summary=round_summary,
-                tool_calls=tool_records,
-                notes=notes,
+                response=response,
+                content=content,
+                stream_handler=stream_handler,
             )
+
+            json_result: Optional[FinalAnswer] = round_result["json_result"]
+            should_break = round_result["should_break"]
+            next_user_content = round_result["next_user_content"]
+
+            if next_user_content:
+                history.append(next_user_content)
 
             if json_result:
                 self.session_manager.save_session(session_id, history)
