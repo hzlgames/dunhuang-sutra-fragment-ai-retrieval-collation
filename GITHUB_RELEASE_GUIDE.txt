@@ -1,0 +1,114 @@
+﻿===============================================
+GitHub Release 创建指南
+===============================================
+
+所有代码和文档已成功推送到GitHub！
+现在请按以下步骤在GitHub网页上创建Release：
+
+步骤1：访问GitHub仓库
+--------------------
+打开浏览器访问：
+https://github.com/hzlgames/dunhuang-sutra-fragment-ai-retrieval-collation
+
+步骤2：进入Releases页面
+--------------------
+1. 点击仓库右侧的 \"Releases\" 链接
+2. 或直接访问：
+   https://github.com/hzlgames/dunhuang-sutra-fragment-ai-retrieval-collation/releases
+
+步骤3：创建新Release
+--------------------
+1. 点击 \"Draft a new release\" 按钮
+2. 填写以下信息：
+
+   【Choose a tag】
+   - 选择已创建的标签: v1.0.0
+   
+   【Release title】
+   - 填入: v1.0.0 - 敦煌经书残卷AI检索与校对系统
+   
+   【Describe this release】
+   - 复制粘贴 RELEASE_NOTES.md 的内容
+   - 或者使用以下简化版本：
+
+------- 复制以下内容 -------
+
+#  首次正式发布
+
+本项目提供完整的敦煌经书残卷AI检索与校对解决方案。
+
+##  主要功能
+
+-  **桌面客户端**：Windows图形界面，支持拖拽上传、批处理
+-  **AI识别**：Google Gemini多模态OCR
+-  **经文检索**：CBETA + Gallica双引擎
+-  **批处理模式**：多图并行，自动管理配额
+-  **断点续传**：失败可恢复
+-  **一键启动**：Windows批处理脚本
+
+##  快速开始
+
+详细安装说明请参考 [INSTALL.md](INSTALL.md)
+
+**Windows用户快速启动：**
+1. 下载Source code (zip)并解压
+2. 安装Python 3.10+和依赖：\pip install -r requirements.txt\
+3. 配置.env文件（参考.env.example）
+4. 双击run_server.bat启动后端
+5. 双击run_client.bat启动客户端
+
+##  技术栈
+
+- FastAPI + Uvicorn
+- Google Gemini 3 Pro (Vertex AI)
+- Python Tkinter
+- CBETA API + Gallica MCP
+
+##  重要提示
+
+- 需要Google Cloud Platform账号和Vertex AI权限
+- 请勿提交service-account-key.json到Git
+- 建议图片分辨率至少1000x1000像素
+
+##  文档
+
+- [README.md](README.md) - 完整使用说明
+- [INSTALL.md](INSTALL.md) - 快速安装指南
+- [docs/vertex_directions.md](docs/vertex_directions.md) - Vertex AI配置
+- [docs/vertex_batch.md](docs/vertex_batch.md) - Batch API说明
+
+------- 复制结束 -------
+
+步骤4：发布设置
+--------------------
+1. 【Set as the latest release】勾选此选项
+2. 【Set as a pre-release】不勾选（这是正式版本）
+3. 【Create a discussion for this release】可选勾选
+
+步骤5：发布
+--------------------
+点击 \"Publish release\" 按钮
+
+完成！
+--------------------
+Release创建成功后，用户可以在以下页面下载：
+https://github.com/hzlgames/dunhuang-sutra-fragment-ai-retrieval-collation/releases/tag/v1.0.0
+
+===============================================
+已完成的工作总结
+===============================================
+
+ 更新.gitignore保护敏感信息
+ 创建.env.example配置模板
+ 清理临时文件和调试文档
+ 创建必要的说明文档
+ 提交所有代码到Git
+ 推送到GitHub远程仓库
+ 创建v1.0.0版本标签
+ 生成RELEASE_NOTES.md
+ 生成INSTALL.md快速安装指南
+
+待完成（需要在GitHub网页操作）：
+ 在GitHub上创建Release（按上述步骤操作）
+
+===============================================
