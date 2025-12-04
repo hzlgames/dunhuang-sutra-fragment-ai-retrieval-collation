@@ -10,6 +10,7 @@ class JobStatusEnum(str, Enum):
     running = "RUNNING"
     succeeded = "SUCCEEDED"
     failed = "FAILED"
+    cancelled = "CANCELLED"
     batch_pending = "BATCH_PENDING"
     batch_running = "BATCH_RUNNING"
     batch_merging = "BATCH_MERGING"
@@ -68,3 +69,28 @@ class ProcessResponse(BaseModel):
     session_id: str
     rounds: List[RoundInfo] = Field(..., description="每一轮的处理信息")
     total_rounds: int
+
+
+class CancelResponse(BaseModel):
+    """取消任务响应"""
+    task_id: str
+    status: JobStatusEnum
+    message: str
+
+
+class ResumeRequest(BaseModel):
+    """断点续传请求"""
+    session_id: str = Field(..., description="要恢复的 session_id")
+
+
+class ResumeResponse(BaseModel):
+    """断点续传响应"""
+    task_id: str = Field(..., description="新创建的任务 ID")
+    session_id: str = Field(..., description="复用的 session_id")
+
+
+class MetaResponse(BaseModel):
+    """服务元信息响应"""
+    version: str
+    output_dir: str
+    supports_batch: bool

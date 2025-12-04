@@ -47,6 +47,26 @@ sessions/
 
 # Ignore temporary inputs, but keep the main input folder structure
 input/temp/
+input/*.png
+input/*.jpg
+input/*.jpeg
+
+# Temporary files and cache
+tmp/
+tmp_*.txt
+tmpout.txt
+
+# Sensitive: Service Account Keys (NEVER commit!)
+service-account-key.json
+*-key.json
+*.pem
+
+# Desktop client data
+desktop_client/data/
+desktop_client/client_config.json
+
+# Debug and test outputs (keep debug scripts, but not outputs)
+test_cbeta_output.txt
 
 # OS Specific
 .DS_Store

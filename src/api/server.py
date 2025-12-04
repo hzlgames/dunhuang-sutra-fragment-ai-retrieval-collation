@@ -1,3 +1,4 @@
+import re
 import uuid
 from pathlib import Path
 from typing import List, Optional
@@ -18,14 +19,19 @@ from src.api.schemas import (
     BatchCreateResponse,
     BatchResultsResponse,
     BatchStatusResponse,
+    CancelResponse,
     JobCreateResponse,
     JobStatusResponse,
     JobStatusEnum,
+    MetaResponse,
     ProcessResponse,
+    ResumeResponse,
     RoundInfo,
 )
 from src.api.task_store import InMemoryTaskStore
 from src.batch_jobs import BatchProcessor
+from src.config import get_output_dir, supports_batch, VERSION
+from src.main import summarize_final_answer, build_fragment_note
 
 load_dotenv()
 
@@ -42,6 +48,22 @@ agent = CBETAAgent(AgentConfig(verbose=False))
 batch_processor = BatchProcessor(agent=agent)
 
 
+def _sanitize_output_name(name: str) -> str:
+    """将文件/文件夹名称中不安全的字符替换为下划线。"""
+    safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", name.strip())
+    safe = safe.strip("._")
+    return safe or "output"
+
+
+def _derive_pic_name(original_name: Optional[str], image_path: Path) -> str:
+    """根据原始文件名或临时文件路径推导图片名称。"""
+    if original_name:
+        candidate = Path(original_name).stem
+    else:
+        candidate = image_path.stem
+    return _sanitize_output_name(candidate)
+
+
 async def _persist_upload(file: UploadFile, namespace: str) -> Path:
     suffix = Path(file.filename or "").suffix or ".png"
     tmp_dir = Path("tmp") / namespace
@@ -52,18 +74,51 @@ async def _persist_upload(file: UploadFile, namespace: str) -> Path:
     return tmp_path
 
 
-def _run_single_job(task_id: str, image_path: Path):
+def _run_single_job(
+    task_id: str,
+    image_path: Path,
+    *,
+    original_name: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+):
+    """
+    执行单图分析任务。
+    
+    Args:
+        task_id: 任务 ID
+        image_path: 图片路径
+        resume_session_id: 若提供，则基于已有 session 续传
+    """
     session_id = None
+    should_delete_image = True  # 默认删除临时图片
     try:
-        task_store.update(task_id, status=JobStatusEnum.running)
-        # 创建新 session
-        session_id = agent.session_manager.create_session()
+        # 检查是否已被取消
+        if task_store.is_cancel_requested(task_id):
+            task_store.update(task_id, status=JobStatusEnum.cancelled)
+            return
+        
+        task_store.update(task_id, status=JobStatusEnum.running, image_path=str(image_path))
+        
+        # 使用已有 session 或创建新 session
+        if resume_session_id:
+            session_id = resume_session_id
+        else:
+            session_id = agent.session_manager.create_session()
         task_store.update(task_id, session_id=session_id)
+        
         # 执行分析（注意：参数名是 resume_session_id）
         result: FinalAnswer | None = agent.analyze_and_locate(
             image_path=str(image_path), 
-            resume_session_id=session_id
+            resume_session_id=session_id,
+            cancel_check=lambda: task_store.is_cancel_requested(task_id),
         )
+        
+        # 再次检查是否被取消
+        if task_store.is_cancel_requested(task_id):
+            task_store.update(task_id, status=JobStatusEnum.cancelled)
+            should_delete_image = False  # 取消时保留图片以便续传
+            return
+        
         if result is None:
             # 当上游因为 Gemini 503 等原因无法给出结构化结果时，优雅地标记为失败
             task_store.update(
@@ -71,7 +126,38 @@ def _run_single_job(task_id: str, image_path: Path):
                 status=JobStatusEnum.failed,
                 error="分析流程未返回结构化结果（可能是模型过载或网络错误），请稍后重试。",
             )
+            should_delete_image = False  # 失败时保留图片以便续传
             return
+        
+        # 保存结果文件到输出目录，每个图片独立子文件夹
+        output_base = get_output_dir()
+        pic_name = _derive_pic_name(original_name, image_path)
+        
+        # 创建以图片名称命名的子文件夹
+        pic_output_dir = output_base / pic_name
+        pic_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 保存 JSON 结果
+        json_path = pic_output_dir / f"{pic_name}_result.json"
+        json_path.write_text(
+            result.model_dump_json(indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        
+        # 保存文本报告
+        report_path = pic_output_dir / f"{pic_name}_report.txt"
+        report_path.write_text(
+            summarize_final_answer(result),
+            encoding="utf-8",
+        )
+        
+        # 保存文献整理说明
+        note_path = pic_output_dir / f"{pic_name}_note.txt"
+        note_path.write_text(
+            build_fragment_note(result, pic_name),
+            encoding="utf-8",
+        )
+        
         task_store.update(
             task_id,
             status=JobStatusEnum.succeeded,
@@ -79,13 +165,15 @@ def _run_single_job(task_id: str, image_path: Path):
         )
     except Exception as exc:
         task_store.update(task_id, status=JobStatusEnum.failed, error=str(exc))
+        should_delete_image = False  # 异常时保留图片以便续传
     finally:
-        # 避免 Windows 上因文件句柄未关闭而导致 PermissionError 终止整个请求
-        try:
-            image_path.unlink(missing_ok=True)
-        except PermissionError as exc:
-            # 仅记录日志，不影响任务最终状态
-            print(f"⚠️ 删除临时文件失败（可能被占用）: {image_path} -> {exc}")
+        # 只有成功完成时才删除临时图片
+        if should_delete_image:
+            try:
+                image_path.unlink(missing_ok=True)
+            except PermissionError as exc:
+                # 仅记录日志，不影响任务最终状态
+                print(f"⚠️ 删除临时文件失败（可能被占用）: {image_path} -> {exc}")
 
 
 @app.post("/api/v1/jobs/image", response_model=JobCreateResponse)
@@ -97,7 +185,13 @@ async def create_async_job(
     tmp_path = await _persist_upload(file, "single-job")
     task_id = str(uuid.uuid4())
     task_store.create(task_id)
-    background_tasks.add_task(_run_single_job, task_id, tmp_path)
+    original_name = file.filename or Path(tmp_path).name
+    background_tasks.add_task(
+        _run_single_job,
+        task_id,
+        tmp_path,
+        original_name=original_name,
+    )
     return JobCreateResponse(task_id=task_id)
 
 
@@ -230,5 +324,94 @@ async def get_job_process(task_id: str):
         session_id=session_id,
         rounds=rounds,
         total_rounds=len(rounds)
+    )
+
+
+# ------------------------------------------------------------------ #
+# 取消与断点续传接口
+# ------------------------------------------------------------------ #
+
+@app.post("/api/v1/jobs/{task_id}/cancel", response_model=CancelResponse)
+async def cancel_job(task_id: str):
+    """请求取消正在进行的任务。"""
+    record = task_store.get(task_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="task not found")
+    
+    if record.status not in (JobStatusEnum.pending, JobStatusEnum.running):
+        raise HTTPException(
+            status_code=400,
+            detail=f"任务状态为 {record.status.value}，无法取消"
+        )
+    
+    success = task_store.request_cancel(task_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="取消请求失败")
+    
+    # 如果任务还在 PENDING 状态，直接标记为 CANCELLED
+    if record.status == JobStatusEnum.pending:
+        task_store.update(task_id, status=JobStatusEnum.cancelled)
+    
+    return CancelResponse(
+        task_id=task_id,
+        status=JobStatusEnum.cancelled,
+        message="取消请求已发送，任务将在下一个检查点停止"
+    )
+
+
+@app.post("/api/v1/jobs/resume", response_model=ResumeResponse)
+async def resume_job(
+    background_tasks: BackgroundTasks,
+    session_id: str,
+    file: UploadFile = File(...)
+):
+    """
+    基于已有 session_id 断点续传。
+    需要重新上传图片文件。
+    """
+    if not file:
+        raise HTTPException(status_code=400, detail="file is required")
+    
+    # 验证 session 是否存在
+    sessions_dir = Path("sessions")
+    rounds_file = sessions_dir / f"{session_id}.rounds.jsonl"
+    if not rounds_file.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"未找到 session {session_id} 的历史记录，无法续传"
+        )
+    
+    # 保存上传的图片
+    tmp_path = await _persist_upload(file, "resume-job")
+    
+    # 创建新任务
+    task_id = str(uuid.uuid4())
+    task_store.create(task_id)
+    
+    # 启动后台任务，传入 resume_session_id
+    original_name = file.filename or Path(tmp_path).name
+    background_tasks.add_task(
+        _run_single_job,
+        task_id,
+        tmp_path,
+        original_name=original_name,
+        resume_session_id=session_id,
+    )
+    
+    return ResumeResponse(task_id=task_id, session_id=session_id)
+
+
+# ------------------------------------------------------------------ #
+# 元信息接口
+# ------------------------------------------------------------------ #
+
+@app.get("/api/v1/meta", response_model=MetaResponse)
+async def get_meta():
+    """获取服务元信息，包括输出目录、版本号等。"""
+    output_dir = get_output_dir()
+    return MetaResponse(
+        version=VERSION,
+        output_dir=str(output_dir.resolve()),
+        supports_batch=supports_batch()
     )
 

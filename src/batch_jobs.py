@@ -1,17 +1,20 @@
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
+from google.cloud import storage
 from PIL import Image
 
 from src.ai_agent import CBETAAgent
 from src.schemas import FinalAnswer
 from src.main import summarize_final_answer, build_fragment_note
+from src.config import get_output_dir
 from src.api.schemas import (
     JobStatusEnum,
     BatchStatusResponse,
@@ -37,9 +40,19 @@ class BatchProcessor:
     负责 orchestrate 多任务 × 多轮 Batch API 调度，并与本地 Session 记录互通。
     """
 
-    def __init__(self, agent: CBETAAgent):
+    def __init__(self, agent: CBETAAgent, *, bucket_name: Optional[str] = None):
         self.agent = agent
-        self.client = genai.Client()
+        # 直接复用 Agent 已初始化好的 Vertex AI 客户端，确保批处理与单图流程共享同一凭据/项目配置。
+        self.client = agent.client
+        self.gcs_bucket_name = bucket_name or os.getenv(
+            "VERTEX_BATCH_BUCKET", "hanhan_dunhuang_batch_storage"
+        )
+        if not self.gcs_bucket_name:
+            raise ValueError(
+                "VERTEX_BATCH_BUCKET 未配置，无法使用 Vertex Batch API。"
+            )
+        self.storage_client = storage.Client()
+        self._gcs_bucket = self.storage_client.bucket(self.gcs_bucket_name)
         self._lock = threading.Lock()
         self._batches: Dict[str, Dict] = {}
 
@@ -87,7 +100,9 @@ class BatchProcessor:
                     batch_id, JobStatusEnum.batch_running, round_index
                 )
 
-                inline_requests = self._build_inline_requests(pending_sessions)
+                input_uri, output_uri = self._prepare_batch_round(
+                    pending_sessions, batch_id, round_index
+                )
 
                 # 使用与单图流程一致的重试策略：
                 # - 普通轮：normal_retries 次（AgentConfig.normal_retries）
@@ -95,10 +110,11 @@ class BatchProcessor:
                 def _create_and_wait():
                     job = self.client.batches.create(
                         model=self.agent.config.model_name,
-                        src=inline_requests,
-                        config={
-                            "display_name": f"batch-{batch_id}-round-{round_index}"
-                        },
+                        src=input_uri,
+                        config=types.CreateBatchJobConfig(
+                            display_name=f"batch-{batch_id}-round-{round_index}",
+                            dest=types.BatchJobDestination(gcs_uri=output_uri),
+                        ),
                     )
                     return self._wait_for_job(job.name)
 
@@ -108,22 +124,34 @@ class BatchProcessor:
                     retry_interval=self.agent.config.retry_interval,
                 )
 
-                # 根据 google-genai 的最新 Batch API，结果位于 job.dest.inlined_responses
-                dest = getattr(job, "dest", None)
-                inline_responses = getattr(dest, "inlined_responses", []) if dest else []
+                responses_payload = self._load_batch_outputs(output_uri)
+                if not responses_payload:
+                    for session in pending_sessions:
+                        session.error = "Batch 返回空结果"
+                    continue
 
-                for idx, item in enumerate(inline_responses):
-                    # 新版 Batch API 不再接受自定义 key/request 包装，
-                    # 因此这里直接按照 inline_responses 与 pending_sessions 的顺序一一对应。
+                for idx, payload in enumerate(responses_payload):
                     if idx >= len(pending_sessions):
                         continue
                     session = pending_sessions[idx]
-                    if item.error:
-                        session.error = self._stringify_error(item.error)
+                    if payload.get("error"):
+                        session.error = self._stringify_error(payload["error"])
                         continue
 
-                    response = item.response
-                    if not response or not response.candidates:
+                    response_data = payload.get("response")
+                    if not response_data:
+                        session.error = "Batch 响应为空"
+                        continue
+
+                    try:
+                        response = types.GenerateContentResponse.model_validate(
+                            response_data
+                        )
+                    except Exception as exc:
+                        session.error = f"解析 Batch 响应失败: {exc}"
+                        continue
+
+                    if not response.candidates:
                         session.error = "空响应"
                         continue
                     content = response.candidates[0].content
@@ -267,20 +295,6 @@ class BatchProcessor:
         parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
         return [types.Content(role="user", parts=parts)]
 
-    def _build_inline_requests(self, sessions: List[SessionJob]) -> List[Dict]:
-        inline_requests: List[Dict[str, Any]] = []
-        for session in sessions:
-            # 当前 google-genai Batch API 的 BatchJobSource 仅接受 contents（及可选 config），
-            # 不允许在 inlined_requests 中直接传 tools / tool_config / generation_config，
-            # 否则会触发 Pydantic 的 extra_forbidden 校验错误。
-            # 因此这里仅传入 contents，保持与 minimal_batch_test 的用法一致。
-            inline_requests.append(
-                {
-                    "contents": session.history,
-                }
-            )
-        return inline_requests
-
     def _stringify_error(self, error: Any) -> str:
         """将 Google Batch API 的 JobError 等对象安全地转成字符串。"""
         if error is None:
@@ -325,24 +339,36 @@ class BatchProcessor:
         self.agent.session_manager.save_session(
             session.session_id, session.history
         )
-        output_dir = Path("output")
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_base = get_output_dir()
+        
+        # 从 alias 中提取原始文件名（去掉 session_id 后缀）
+        # alias 格式为: filename_sessionid[:8]
+        # 提取原始文件名作为文件夹名
+        if "_" in session.alias:
+            # 去掉最后一个下划线及其后的内容（session_id）
+            pic_name = session.alias.rsplit("_", 1)[0]
+        else:
+            pic_name = session.alias
+        
+        # 创建以图片名称命名的子文件夹
+        pic_output_dir = output_base / pic_name
+        pic_output_dir.mkdir(parents=True, exist_ok=True)
 
-        json_path = output_dir / f"{session.alias}_result.json"
+        json_path = pic_output_dir / f"{pic_name}_result.json"
         json_path.write_text(
             session.final_answer.model_dump_json(indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
-        report_path = output_dir / f"{session.alias}_report.txt"
+        report_path = pic_output_dir / f"{pic_name}_report.txt"
         report_path.write_text(
             summarize_final_answer(session.final_answer),
             encoding="utf-8",
         )
 
-        note_path = output_dir / f"{session.alias}_note.txt"
+        note_path = pic_output_dir / f"{pic_name}_note.txt"
         note_path.write_text(
-            build_fragment_note(session.final_answer, session.alias),
+            build_fragment_note(session.final_answer, pic_name),
             encoding="utf-8",
         )
 
@@ -355,4 +381,71 @@ class BatchProcessor:
                 return
             batch["status"] = status
             batch["round"] = round_index
+
+    # ------------------------------------------------------------------ #
+    # GCS helpers
+    # ------------------------------------------------------------------ #
+    def _prepare_batch_round(
+        self, sessions: List[SessionJob], batch_id: str, round_index: int
+    ) -> Tuple[str, str]:
+        """
+        构建 JSONL 输入文件并上传到 GCS，返回 (input_uri, output_uri)。
+        """
+        local_dir = Path("tmp") / "batch_inputs" / batch_id / f"round_{round_index:02d}"
+        local_dir.mkdir(parents=True, exist_ok=True)
+        input_path = local_dir / "input.jsonl"
+
+        with input_path.open("w", encoding="utf-8") as f:
+            for session in sessions:
+                contents_payload = [
+                    json.loads(content.model_dump_json()) for content in session.history
+                ]
+                record = {"request": {"contents": contents_payload}}
+                f.write(json.dumps(record, ensure_ascii=False))
+                f.write("\n")
+
+        gcs_input_path = f"batches/{batch_id}/round_{round_index:02d}/input.jsonl"
+        self._upload_file_to_gcs(input_path, gcs_input_path)
+
+        gcs_output_prefix = f"batches/{batch_id}/round_{round_index:02d}/outputs/"
+        input_uri = f"gs://{self.gcs_bucket_name}/{gcs_input_path}"
+        output_uri = f"gs://{self.gcs_bucket_name}/{gcs_output_prefix}"
+        return input_uri, output_uri
+
+    def _upload_file_to_gcs(self, local_path: Path, blob_path: str):
+        blob = self._gcs_bucket.blob(blob_path)
+        blob.upload_from_filename(str(local_path))
+
+    def _load_batch_outputs(self, dest_uri: str) -> List[Dict[str, Any]]:
+        bucket_name, prefix = self._split_gs_uri(dest_uri)
+        bucket = (
+            self._gcs_bucket
+            if bucket_name == self.gcs_bucket_name
+            else self.storage_client.bucket(bucket_name)
+        )
+
+        payloads: List[Dict[str, Any]] = []
+        for blob in bucket.list_blobs(prefix=prefix):
+            if not blob.name.endswith(".jsonl"):
+                continue
+            data = blob.download_as_text(encoding="utf-8")
+            for line in data.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payloads.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return payloads
+
+    @staticmethod
+    def _split_gs_uri(uri: str) -> Tuple[str, str]:
+        if not uri.startswith("gs://"):
+            raise ValueError(f"无效的 GCS URI: {uri}")
+        path = uri[5:]
+        parts = path.split("/", 1)
+        bucket = parts[0]
+        prefix = parts[1] if len(parts) > 1 else ""
+        return bucket, prefix
 

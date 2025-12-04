@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
 
 from src.cbeta_tools import CBETATools
 from src.gallica_client import GallicaClient
@@ -136,12 +137,29 @@ class CBETAAgent:
         初始化 CBETA 智能代理，加载 Gemini Client、工具映射与会话管理器。
         参数保持与 test_gemini3 一致（model=gemini-3-pro-preview、temperature=1.0、默认 high 思考等级）。
         """
-        self.config = config or AgentConfig()
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY 未配置，无法初始化 CBETAAgent。")
+        # 加载 .env，确保本进程能读取 Vertex 所需环境变量
+        load_dotenv(override=False)
 
-        self.client = genai.Client(api_key=api_key)
+        self.config = config or AgentConfig()
+
+        # ===== 使用 Vertex AI (Service Account + ADC) 初始化客户端 =====
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+        credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+
+        if not project_id or not credentials_path:
+            raise ValueError(
+                "Vertex AI 配置缺失：请在环境变量或 `.env` 中设置 "
+                "GOOGLE_CLOUD_PROJECT、GOOGLE_CLOUD_LOCATION、GOOGLE_APPLICATION_CREDENTIALS。\n"
+                "详细说明见 docs/vertex_directions.md。"
+            )
+
+        # google-genai 在 vertexai=True 模式下会基于 ADC 与 Vertex AI 通信
+        self.client = genai.Client(
+            vertexai=True,
+            project=project_id,
+            location=location,
+        )
         self.session_manager = SessionManager()
         self.cbeta_tools = CBETATools()
         
@@ -914,6 +932,7 @@ class CBETAAgent:
         stream_handler: Optional[StreamHandler] = None,
         resume_session_id: Optional[str] = None,
         include_final_output: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> FinalAnswer:
         """
         主流程：分析并定位经文出处。
@@ -923,6 +942,9 @@ class CBETAAgent:
         - AI 可随时选择不调用工具，提前结束
         - 可选择跳过最终结构化输出，仅依靠轮次存档
         - 普通轮重试 normal_retries 次，最终轮重试 final_retries 次
+        
+        Args:
+            cancel_check: 可选的取消检查回调，返回 True 表示应取消任务
         """
         history: List[types.Content] = []
         if resume_session_id:
@@ -973,6 +995,13 @@ class CBETAAgent:
         
         # 工具调用阶段（最多 max_tool_rounds 轮）
         while tool_round < self.config.max_tool_rounds:
+            # 检查是否被取消
+            if cancel_check and cancel_check():
+                if self.config.verbose:
+                    print("⏹️ 任务被取消，保存当前进度...")
+                self.session_manager.save_session(session_id, history)
+                return None
+            
             tool_round += 1
             if self.config.verbose:
                 print(f"\n🔄 第 {tool_round}/{self.config.max_tool_rounds} 轮思考...")
@@ -1039,6 +1068,13 @@ class CBETAAgent:
                 break
         
         # ===== 最终结构化输出轮（不计入工具调用轮数） =====
+        # 再次检查是否被取消
+        if cancel_check and cancel_check():
+            if self.config.verbose:
+                print("⏹️ 任务被取消，保存当前进度...")
+            self.session_manager.save_session(session_id, history)
+            return None
+        
         if self.config.verbose:
             print(f"\n📊 工具调用阶段结束（共 {tool_round} 轮）")
         

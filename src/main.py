@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List
@@ -9,6 +10,7 @@ load_dotenv()
 
 from src.ai_agent import CBETAAgent, AgentConfig, StreamHandler
 from src.schemas import FinalAnswer
+from src.config import get_output_dir
 
 
 def parse_args():
@@ -22,8 +24,8 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
-        default="output",
-        help="结果与日志输出目录，默认 output/",
+        default=None,
+        help="结果与日志输出目录，默认使用环境变量 OUTPUT_DIR 或 output/",
     )
     parser.add_argument(
         "--quiet",
@@ -239,7 +241,12 @@ def build_fragment_note(answer: FinalAnswer, image_name: str) -> str:
 
 def process_image(agent: CBETAAgent, image_path: Path, output_dir: Path, mirror_stdout: bool):
     print(f"\n📷 处理图片: {image_path.name}")
-    log_path = output_dir / f"{image_path.stem}_stream.jsonl"
+    
+    # 创建以图片名称命名的子文件夹
+    pic_output_dir = output_dir / image_path.stem
+    pic_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_path = pic_output_dir / f"{image_path.stem}_stream.jsonl"
     handler = build_stream_handler(log_path, mirror_stdout)
     try:
         result = agent.analyze_and_locate(image_path=str(image_path), stream_handler=handler)
@@ -251,16 +258,16 @@ def process_image(agent: CBETAAgent, image_path: Path, output_dir: Path, mirror_
         print("❌ 本次未获取到结构化结果")
         return
 
-    json_path = output_dir / f"{image_path.stem}_result.json"
+    json_path = pic_output_dir / f"{image_path.stem}_result.json"
     json_path.write_text(result.model_dump_json(indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"💾 结构化结果已保存: {json_path}")
 
-    report_path = output_dir / f"{image_path.stem}_report.txt"
+    report_path = pic_output_dir / f"{image_path.stem}_report.txt"
     report_path.write_text(summarize_final_answer(result), encoding="utf-8")
     print(f"📝 文本报告已保存: {report_path}")
 
-    # 生成“文献整理说明”附带文档
-    note_path = output_dir / f"{image_path.stem}_note.txt"
+    # 生成"文献整理说明"附带文档
+    note_path = pic_output_dir / f"{image_path.stem}_note.txt"
     note_path.write_text(build_fragment_note(result, image_path.stem), encoding="utf-8")
     print(f"📄 文献整理说明已保存: {note_path}")
 
@@ -268,8 +275,8 @@ def process_image(agent: CBETAAgent, image_path: Path, output_dir: Path, mirror_
 def main():
     args = parse_args()
     input_dir = Path(args.input)
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # 优先使用命令行参数，否则使用环境变量或默认值
+    output_dir = Path(args.output) if args.output else get_output_dir()
 
     images = list(iter_images(input_dir))
     if not images:
